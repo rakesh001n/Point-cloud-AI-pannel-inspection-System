@@ -13,6 +13,8 @@ python hmi.py
 
 The HMI includes camera and serial-port dropdowns, live laser overlay, calibration fields, manual servo movement, automatic scan range, serial debug log, point-cloud count, and PLY save dialog. It is compatible with the supplied Arduino sketch and uses `9600` baud, sends a plain angle such as `90`, and accepts replies such as `Servo moved to: 90`.
 
+After capturing a scan, choose `Points`, `Surface`, or `Points + surface` and press `Open 3D model`. A separate embedded 3D page supports orbital rotation with left-drag, pan with middle-drag, zoom with the wheel, and view reset from the toolbar. Surface mode creates an interactive triangulated surface from the scan coordinates. Use Points mode when the scan is sparse or the surface has artifacts.
+
 The rack travel calibration is `50 mm / 180 degrees` by default. Change `Travel / 180 deg` if the actual rack displacement differs. `Direction` controls whether increasing servo angle adds or subtracts along the selected scan axis. Do not add the `MOVE` command prefix to the current Arduino sketch; the HMI sends only the number.
 
 ## Calibration

@@ -25,6 +25,7 @@ class ScannerHMI(tk.Tk):
         self.configure(bg="#20252b")
         self.camera: cv2.VideoCapture | None = None
         self.arduino: serial.Serial | None = None
+        self.camera_map: dict[str, str | int] = {}
         self.port_map: dict[str, str] = {}
         self.latest_frame: np.ndarray | None = None
         self.latest_points = np.empty((0, 3), dtype=np.float32)
@@ -136,7 +137,12 @@ class ScannerHMI(tk.Tk):
         ttk.Button(box, text="Stop scan", command=self.stop_scan).grid(row=4, column=0, columnspan=2, sticky="ew", pady=3)
         ttk.Button(box, text="Clear cloud", command=self.clear_cloud).grid(row=5, column=0, columnspan=2, sticky="ew", pady=3)
         ttk.Button(box, text="Export PLY", command=self.export_cloud).grid(row=6, column=0, columnspan=2, sticky="ew", pady=3)
-        ttk.Label(box, text="The automatic scan sends MOVE <degrees> to Arduino.", wraplength=260).grid(row=7, column=0, columnspan=2, pady=(8, 0))
+        ttk.Label(box, text="3D display").grid(row=7, column=0, sticky="w", pady=3)
+        self.model_mode = ttk.Combobox(box, values=("Points", "Surface", "Points + surface"), state="readonly", width=16)
+        self.model_mode.set("Points + surface")
+        self.model_mode.grid(row=7, column=1, sticky="ew", pady=3)
+        ttk.Button(box, text="Open 3D model", command=self.open_model).grid(row=8, column=0, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(box, text="Automatic scan sends the servo angle to Arduino.", wraplength=260).grid(row=9, column=0, columnspan=2, pady=(8, 0))
 
     def log_message(self, message: str) -> None:
         self.log.configure(state="normal")
@@ -145,11 +151,20 @@ class ScannerHMI(tk.Tk):
         self.log.configure(state="disabled")
 
     def refresh_cameras(self) -> None:
+        self.camera_map = {}
+        devices: list[tuple[str, int]]
+        linux_devices = sorted(Path("/dev").glob("video[0-9]*"), key=lambda path: path.name)
+        devices = [(str(path), int(path.name[5:])) for path in linux_devices]
+        if not devices:
+            devices = [(f"camera index {index}", index) for index in range(4)]
         found = []
-        for index in range(10):
-            cap = cv2.VideoCapture(index)
+        for display_path, device in devices:
+            backend = cv2.CAP_V4L2
+            cap = cv2.VideoCapture(device, backend)
             if cap.isOpened():
-                found.append(str(index))
+                display = f"USB camera - {display_path}"
+                self.camera_map[display] = device
+                found.append(display)
             cap.release()
         self.camera_combo["values"] = found
         if found and self.camera_var.get() not in found:
@@ -181,7 +196,12 @@ class ScannerHMI(tk.Tk):
         if not self.camera_var.get():
             messagebox.showerror("Camera", "Select a camera first")
             return
-        self.camera = cv2.VideoCapture(int(self.camera_var.get()))
+        device = self.camera_map.get(self.camera_var.get())
+        if device is None:
+            messagebox.showerror("Camera", "Select a camera first")
+            return
+        backend = cv2.CAP_V4L2 if isinstance(device, str) else cv2.CAP_ANY
+        self.camera = cv2.VideoCapture(device, backend)
         if not self.camera.isOpened():
             self.camera = None
             messagebox.showerror("Camera", "Could not open the selected camera")
@@ -350,6 +370,75 @@ class ScannerHMI(tk.Tk):
             write_ply(Path(path), np.vstack(self.cloud))
             self.log_message(f"Exported {self.cloud_size()} points to {path}")
             self.status.set(f"Saved {self.cloud_size()} points")
+
+    def open_model(self) -> None:
+        """Open an embedded orbital Matplotlib 3D viewer for the captured cloud."""
+        if not self.cloud:
+            messagebox.showwarning("3D model", "Capture a scan before opening the 3D model")
+            return
+        points = np.vstack(self.cloud).copy()
+        mode = self.model_mode.get()
+        self.status.set("Preparing 3D model...")
+        self.log_message(f"Opening 3D viewer: {len(points)} points, mode {mode}")
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+            from matplotlib.figure import Figure
+
+            window = tk.Toplevel(self)
+            window.title("Laser scan 3D model")
+            window.geometry("1100x760")
+            window.configure(bg="#20252b")
+            figure = Figure(figsize=(10, 7), dpi=100)
+            figure.patch.set_facecolor("#20252b")
+            axis = figure.add_subplot(111, projection="3d")
+            axis.set_facecolor("#101316")
+            axis.tick_params(colors="#d9e2e8")
+            axis.xaxis.label.set_color("#d9e2e8")
+            axis.yaxis.label.set_color("#d9e2e8")
+            axis.zaxis.label.set_color("#d9e2e8")
+            axis.set_xlabel("X (mm)")
+            axis.set_ylabel("Y (mm)")
+            axis.set_zlabel("Z (mm)")
+            axis.view_init(elev=25, azim=-60)
+
+            if mode in ("Points", "Points + surface"):
+                axis.scatter(points[:, 0], points[:, 1], points[:, 2], s=2, c="#39d6c4", depthshade=True)
+            if mode in ("Surface", "Points + surface") and len(points) >= 30:
+                try:
+                    # The rack axis and one cross-section coordinate form a
+                    # 2D domain for a lightweight interactive surface view.
+                    scan_axis = "XYZ".index(self.axis.get())
+                    other_axes = [i for i in range(3) if i != scan_axis]
+                    other_axis = max(other_axes, key=lambda i: np.ptp(points[:, i]))
+                    axis.plot_trisurf(points[:, scan_axis], points[:, other_axis], points[:, 3 - scan_axis - other_axis],
+                                      color="#4d9dcc", alpha=0.58, linewidth=0.08, edgecolor="#b8e3ef")
+                except (ValueError, RuntimeError) as error:
+                    self.log_message(f"Surface reconstruction skipped: {error}")
+                    if mode == "Surface":
+                        messagebox.showwarning("3D model", "Surface reconstruction failed; showing points instead.")
+            elif mode == "Surface":
+                messagebox.showwarning("3D model", "At least 30 points are needed for surface reconstruction.")
+
+            ranges = np.ptp(points, axis=0)
+            ranges[ranges == 0] = 1
+            axis.set_box_aspect(ranges)
+            canvas = FigureCanvasTkAgg(figure, master=window)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            toolbar = NavigationToolbar2Tk(canvas, window, pack_toolbar=False)
+            toolbar.update()
+            toolbar.pack(fill="x")
+            ttk.Label(window, text="Rotate: left drag | Pan: middle drag | Zoom: wheel | Reset: toolbar home",
+                      background="#20252b", foreground="#d9e2e8").pack(fill="x", padx=8, pady=5)
+            window.protocol("WM_DELETE_WINDOW", window.destroy)
+            self.status.set("3D viewer ready")
+        except ImportError:
+            messagebox.showerror("3D model", "Matplotlib is not installed. Run: pip install -r requirements.txt")
+            self.status.set("Matplotlib is unavailable")
+        except Exception as error:
+            self.log_message(f"3D viewer error: {error}")
+            messagebox.showerror("3D model", str(error))
+            self.status.set("3D model failed")
 
     def close(self) -> None:
         self.scanning = False
