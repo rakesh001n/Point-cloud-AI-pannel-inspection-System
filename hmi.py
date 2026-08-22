@@ -10,7 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 import cv2
 import numpy as np
 import serial
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
 from serial.tools import list_ports
 
 from scanner import Settings, laser_centerline, laser_mask, triangulate, write_ply
@@ -47,25 +47,39 @@ class ScannerHMI(tk.Tk):
         style.configure("TLabelframe.Label", background="#20252b", foreground="#72d6c9")
         style.configure("TButton", padding=6)
 
-        self.columnconfigure(0, weight=0)
-        self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
         left = ttk.Frame(self, padding=12)
-        left.grid(row=0, column=0, sticky="ns")
         right = ttk.Frame(self, padding=(0, 12, 12, 12))
-        right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(0, weight=1)
         right.rowconfigure(1, weight=0)
         right.columnconfigure(0, weight=1)
+
+        # The sash lets the operator widen the controls without shrinking the
+        # camera/model page permanently.
+        panes = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashwidth=7, sashpad=1,
+                               showhandle=True, opaqueresize=True, bg="#39434b",
+                               relief="flat", borderwidth=0)
+        panes.grid(row=0, column=0, sticky="nsew")
+        panes.add(left, minsize=290, width=350, stretch="never")
+        panes.add(right, minsize=600, stretch="always")
 
         self.make_connections(left)
         self.make_calibration(left)
         self.make_motion(left)
         self.make_actions(left)
 
-        self.preview = tk.Label(right, bg="#101316", text="Connect a camera to begin", fg="#9daab5")
-        self.preview.grid(row=0, column=0, sticky="nsew")
+        self.preview_area = ttk.Frame(right)
+        self.preview_area.grid(row=0, column=0, sticky="nsew")
+        self.preview = tk.Label(self.preview_area, bg="#101316", text="Connect a camera to begin", fg="#9daab5")
+        self.preview.pack(fill="both", expand=True)
+        self.model_area = ttk.Frame(right)
+        model_bar = ttk.Frame(self.model_area)
+        model_bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(model_bar, text="Back to camera", command=self.show_camera).pack(side="left")
+        ttk.Label(model_bar, text="Embedded 3D model").pack(side="left", padx=12)
+        self.model_content = ttk.Frame(self.model_area)
+        self.model_content.pack(fill="both", expand=True)
         self.log = tk.Text(right, height=8, bg="#15191d", fg="#b9f4d8", insertbackground="white",
                            relief="flat", state="disabled")
         self.log.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -243,7 +257,10 @@ class ScannerHMI(tk.Tk):
                 cv2.putText(frame, f"laser points: {len(self.latest_points)} | cloud: {self.cloud_size()}",
                             (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
                 image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                image.thumbnail((850, 620))
+                width = max(2, self.preview.winfo_width())
+                height = max(2, self.preview.winfo_height())
+                # Crop rather than letterbox so the live feed fills the page.
+                image = ImageOps.fit(image, (width, height), method=Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(image)
                 self.preview.configure(image=photo, text="")
                 self.preview.image = photo
@@ -372,7 +389,7 @@ class ScannerHMI(tk.Tk):
             self.status.set(f"Saved {self.cloud_size()} points")
 
     def open_model(self) -> None:
-        """Open an embedded orbital Matplotlib 3D viewer for the captured cloud."""
+        """Replace the camera page with an embedded orbital 3D viewer."""
         if not self.cloud:
             messagebox.showwarning("3D model", "Capture a scan before opening the 3D model")
             return
@@ -384,10 +401,10 @@ class ScannerHMI(tk.Tk):
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
             from matplotlib.figure import Figure
 
-            window = tk.Toplevel(self)
-            window.title("Laser scan 3D model")
-            window.geometry("1100x760")
-            window.configure(bg="#20252b")
+            for child in self.model_content.winfo_children():
+                child.destroy()
+            self.preview_area.grid_remove()
+            self.model_area.grid(row=0, column=0, sticky="nsew")
             figure = Figure(figsize=(10, 7), dpi=100)
             figure.patch.set_facecolor("#20252b")
             axis = figure.add_subplot(111, projection="3d")
@@ -422,15 +439,13 @@ class ScannerHMI(tk.Tk):
             ranges = np.ptp(points, axis=0)
             ranges[ranges == 0] = 1
             axis.set_box_aspect(ranges)
-            canvas = FigureCanvasTkAgg(figure, master=window)
+            canvas = FigureCanvasTkAgg(figure, master=self.model_content)
             canvas.draw()
             canvas.get_tk_widget().pack(fill="both", expand=True)
-            toolbar = NavigationToolbar2Tk(canvas, window, pack_toolbar=False)
+            toolbar = NavigationToolbar2Tk(canvas, self.model_content, pack_toolbar=False)
             toolbar.update()
             toolbar.pack(fill="x")
-            ttk.Label(window, text="Rotate: left drag | Pan: middle drag | Zoom: wheel | Reset: toolbar home",
-                      background="#20252b", foreground="#d9e2e8").pack(fill="x", padx=8, pady=5)
-            window.protocol("WM_DELETE_WINDOW", window.destroy)
+            ttk.Label(self.model_content, text="Rotate: left drag | Pan: middle drag | Zoom: wheel | Reset: toolbar home").pack(fill="x", padx=8, pady=5)
             self.status.set("3D viewer ready")
         except ImportError:
             messagebox.showerror("3D model", "Matplotlib is not installed. Run: pip install -r requirements.txt")
@@ -439,6 +454,12 @@ class ScannerHMI(tk.Tk):
             self.log_message(f"3D viewer error: {error}")
             messagebox.showerror("3D model", str(error))
             self.status.set("3D model failed")
+
+    def show_camera(self) -> None:
+        """Return the main content area to the live camera page."""
+        self.model_area.grid_remove()
+        self.preview_area.grid()
+        self.status.set("Camera view")
 
     def close(self) -> None:
         self.scanning = False
