@@ -1,0 +1,20 @@
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# Generated scan output
+*.ply
+*.pcd
+*.xyz
+core
+core.*
