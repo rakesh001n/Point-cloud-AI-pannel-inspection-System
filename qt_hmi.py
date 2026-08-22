@@ -2,6 +2,7 @@
 
 This is intentionally separate from hmi.py while the embedded 3D interface
 is being evaluated. It keeps the same camera, Arduino, and scan protocol.
+MSD project
 """
 
 from __future__ import annotations
