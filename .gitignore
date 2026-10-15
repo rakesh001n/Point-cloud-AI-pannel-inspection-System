@@ -18,3 +18,5 @@ __pycache__/
 *.xyz
 core
 core.*
+.runtime-libs/
+*.deb

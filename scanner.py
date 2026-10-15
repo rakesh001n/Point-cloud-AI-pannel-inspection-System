@@ -40,22 +40,138 @@ def laser_mask(frame: np.ndarray, settings: Settings) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
 
-def laser_centerline(mask: np.ndarray, settings: Settings) -> tuple[np.ndarray, np.ndarray]:
-    """Find the brightest laser pixel per column and return x/y arrays."""
+def median_preprocess(frame: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+    """Return a median-filtered copy of a camera frame."""
+    if frame is None or frame.size == 0:
+        raise ValueError("Cannot filter an empty image")
+    if kernel_size not in (3, 5, 7) or kernel_size % 2 == 0:
+        raise ValueError("Median kernel size must be 3, 5, or 7")
+    if frame.ndim < 2 or min(frame.shape[:2]) < kernel_size:
+        raise ValueError("Median kernel must fit inside the image")
+    return cv2.medianBlur(frame.copy(), kernel_size)
+
+
+def laser_centerline(
+    mask: np.ndarray,
+    settings: Settings,
+    frame: Optional[np.ndarray] = None,
+    method: str = "median",
+    window_radius: int = 3,
+    min_confidence: float = 0.15,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find the laser coordinate per column.
+
+    ``median`` preserves the original detector. ``subpixel`` computes an
+    intensity-weighted centroid around the masked stripe and can return
+    fractional image Y coordinates. Invalid or low-confidence columns are
+    discarded rather than interpolated across object edges.
+    """
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
         return np.empty(0), np.empty(0)
+    if method not in ("median", "subpixel"):
+        raise ValueError(f"Unknown laser centerline method: {method}")
     centers_x, centers_y = [], []
-    half_width = max(1, settings.line_width_px // 2)
     for x in np.unique(xs):
         column = ys[xs == x]
-        # Median is stable when the laser is several pixels wide.
-        y = float(np.median(column))
-        if half_width and len(column) < 1:
-            continue
+        if method == "median" or frame is None:
+            y = float(np.median(column))
+        else:
+            center = float(np.median(column))
+            low = max(0, int(math.floor(center)) - max(1, window_radius))
+            high = min(mask.shape[0], int(math.ceil(center)) + max(1, window_radius) + 1)
+            local_y = np.arange(low, high)
+            valid = mask[local_y, x] > 0
+            local_y = local_y[valid]
+            if len(local_y) < 2:
+                continue
+            if frame.ndim == 3:
+                # Red laser energy is primarily in the BGR red channel.
+                intensity = frame[local_y, x, 2].astype(np.float64)
+            else:
+                intensity = frame[local_y, x].astype(np.float64)
+            if not len(intensity) or np.max(intensity) >= 254:
+                continue
+            baseline = np.percentile(intensity, 20)
+            weights = np.maximum(intensity - baseline, 0.0)
+            total = float(weights.sum())
+            peak = float(weights.max())
+            if total <= 0 or peak / total < min_confidence:
+                continue
+            y = float(np.sum(local_y * weights) / total)
         centers_x.append(float(x))
         centers_y.append(y)
     return np.asarray(centers_x), np.asarray(centers_y)
+
+
+def savitzky_golay_profile(points: np.ndarray, window_length: int = 7, polyorder: int = 2) -> np.ndarray:
+    """Smooth ordered profile depth while preserving X/Y correspondence."""
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("Points must have shape (N, 3)")
+    if len(points) == 0:
+        return points.copy()
+    if window_length <= polyorder or window_length % 2 == 0:
+        raise ValueError("Savitzky-Golay window must be odd and greater than polynomial order")
+    effective_window = min(window_length, len(points) if len(points) % 2 else len(points) - 1)
+    if effective_window <= polyorder:
+        return points.copy()
+    from scipy.signal import savgol_filter
+    filtered = points.astype(np.float32, copy=True)
+    filtered[:, 2] = savgol_filter(filtered[:, 2], effective_window, polyorder).astype(np.float32)
+    return filtered
+
+
+def kalman_profile(points: np.ndarray, process_noise: float = 1e-2, measurement_noise: float = 1.0) -> np.ndarray:
+    """Apply a scalar Kalman filter to ordered profile depth values."""
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("Points must have shape (N, 3)")
+    if process_noise < 0 or measurement_noise <= 0:
+        raise ValueError("Process noise must be non-negative and measurement noise positive")
+    filtered = points.astype(np.float32, copy=True)
+    valid = np.isfinite(filtered[:, 2])
+    if not np.any(valid):
+        return filtered[:0]
+    first = int(np.flatnonzero(valid)[0])
+    estimate = float(filtered[first, 2])
+    covariance = measurement_noise
+    for index in range(first, len(filtered)):
+        if not valid[index]:
+            continue
+        covariance += process_noise
+        gain = covariance / (covariance + measurement_noise)
+        estimate += gain * (float(filtered[index, 2]) - estimate)
+        covariance = (1.0 - gain) * covariance
+        filtered[index, 2] = estimate
+    return filtered[valid]
+
+
+def statistical_outlier_removal(points: np.ndarray, neighbors: int = 20, std_ratio: float = 2.0) -> np.ndarray:
+    """Return a new cloud with isolated points removed using Open3D SOR."""
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("Points must have shape (N, 3)")
+    if neighbors <= 0 or std_ratio <= 0:
+        raise ValueError("SOR neighbors and standard-deviation ratio must be positive")
+    if len(points) <= 2:
+        return points.astype(np.float32, copy=True)
+    import open3d as o3d
+    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points.astype(np.float64)))
+    effective_neighbors = min(neighbors, len(points) - 1)
+    filtered, _ = cloud.remove_statistical_outlier(effective_neighbors, std_ratio)
+    return np.asarray(filtered.points, dtype=np.float32).copy()
+
+
+def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Return a new cloud downsampled with an Open3D voxel grid."""
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("Points must have shape (N, 3)")
+    if voxel_size <= 0:
+        raise ValueError("Voxel size must be positive")
+    if len(points) == 0:
+        return points.astype(np.float32, copy=True)
+    import open3d as o3d
+    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points.astype(np.float64)))
+    filtered = cloud.voxel_down_sample(voxel_size)
+    return np.asarray(filtered.points, dtype=np.float32).copy()
 
 
 def triangulate(xs: np.ndarray, ys: np.ndarray, width: int, height: int, settings: Settings) -> np.ndarray:

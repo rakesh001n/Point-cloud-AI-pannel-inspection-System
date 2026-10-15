@@ -9,17 +9,28 @@ from __future__ import annotations
 
 import sys
 import time
+import os
+import ctypes
 from pathlib import Path
 
 import cv2
 import numpy as np
 import serial
+import PySide6
+# Allow the application to run on systems where the user cannot install the
+# small XCB cursor runtime package with sudo. The bundled copy is optional.
+local_xcb_cursor = Path(__file__).parent / ".runtime-libs" / "usr" / "lib" / "x86_64-linux-gnu" / "libxcb-cursor.so.0"
+if local_xcb_cursor.exists():
+    ctypes.CDLL(str(local_xcb_cursor), mode=ctypes.RTLD_GLOBAL)
+# OpenCV ships a Qt plugin directory that can shadow PySide6's plugins. Point
+# Qt at the matching PySide6 plugins before QApplication is constructed.
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(Path(PySide6.__file__).parent / "Qt" / "plugins")
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QPlainTextEdit, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QPlainTextEdit, QScrollArea, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 from serial.tools import list_ports
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
@@ -27,14 +38,26 @@ from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from plyfile import PlyData
 
-from scanner import Settings, laser_centerline, laser_mask, triangulate, write_ply
+from scanner import (
+    Settings, kalman_profile, laser_centerline, laser_mask, median_preprocess,
+    savitzky_golay_profile, statistical_outlier_removal, triangulate, voxel_downsample,
+    write_ply,
+)
 
 
 class QtScanner(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Laser Triangulation Scanner")
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowCloseButtonHint
+        )
         self.resize(1400, 850)
+        self.setMinimumSize(1000, 650)
         self.camera: cv2.VideoCapture | None = None
         self.arduino: serial.Serial | None = None
         self.camera_map: dict[str, int] = {}
@@ -42,6 +65,9 @@ class QtScanner(QMainWindow):
         self.latest_points = np.empty((0, 3), dtype=np.float32)
         self.latest_frame: np.ndarray | None = None
         self.cloud: list[np.ndarray] = []
+        self.raw_cloud: list[np.ndarray] = []
+        self.raw_profiles: list[np.ndarray] = []
+        self.raw_angles: list[float] = []
         self.scan_angles: list[float] = []
         self.scan_index = 0
         self.scanning = False
@@ -74,7 +100,13 @@ class QtScanner(QMainWindow):
         controls.setMaximumWidth(600)
         controls_layout = QVBoxLayout(controls)
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(controls)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        controls_scroll.setFrameShape(QScrollArea.NoFrame)
+        controls_scroll.setWidget(controls)
+        splitter.addWidget(controls_scroll)
 
         connections = QGroupBox("Connections")
         grid = QGridLayout(connections)
@@ -125,6 +157,33 @@ class QtScanner(QMainWindow):
             form.addRow(label, widget)
         controls_layout.addWidget(motion)
 
+        filtering = QGroupBox("Filtering")
+        filter_form = QFormLayout(filtering)
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems((
+            "None (Raw Data)", "Median Filtering", "Subpixel Laser-Line Extraction",
+            "Statistical Outlier Removal (SOR)", "Savitzky–Golay Filtering",
+            "Voxel Grid Downsampling", "Kalman Filtering",
+        ))
+        self.filter_combo.currentTextChanged.connect(self.update_filter_controls)
+        filter_form.addRow("Technique", self.filter_combo)
+        self.filter_params = QWidget()
+        self.filter_params_form = QFormLayout(self.filter_params)
+        self.filter_params_form.setContentsMargins(0, 0, 0, 0)
+        filter_form.addRow(self.filter_params)
+        filter_buttons = QHBoxLayout()
+        apply_filter = QPushButton("Apply Filter")
+        apply_filter.clicked.connect(self.apply_filter)
+        reset_filter = QPushButton("Reset to Raw")
+        reset_filter.clicked.connect(self.reset_filter)
+        filter_buttons.addWidget(apply_filter)
+        filter_buttons.addWidget(reset_filter)
+        filter_form.addRow(filter_buttons)
+        self.filter_stats = QLabel("Raw: 0 | Displayed: 0")
+        self.filter_stats.setWordWrap(True)
+        filter_form.addRow(self.filter_stats)
+        controls_layout.addWidget(filtering)
+
         actions = QGroupBox("Scan")
         form = QFormLayout(actions)
         self.manual_angle = self.field("0")
@@ -141,6 +200,7 @@ class QtScanner(QMainWindow):
         self.status.setWordWrap(True)
         controls_layout.addWidget(self.status)
         controls_layout.addStretch()
+        self.update_filter_controls(self.filter_combo.currentText())
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -259,8 +319,17 @@ class QtScanner(QMainWindow):
             settings = self.scanner_settings()
         except ValueError:
             settings = Settings()
-        mask = laser_mask(frame, settings)
-        xs, ys = laser_centerline(mask, settings)
+        processing_frame = frame
+        method = "median"
+        if self.filter_combo.currentText() == "Median Filtering":
+            kernel = self.median_kernel.value() if hasattr(self, "median_kernel") else 3
+            processing_frame = median_preprocess(frame, kernel)
+        elif self.filter_combo.currentText() == "Subpixel Laser-Line Extraction":
+            method = "subpixel"
+        mask = laser_mask(processing_frame, settings)
+        window_radius = self.subpixel_window.value() if hasattr(self, "subpixel_window") else 3
+        xs, ys = laser_centerline(mask, settings, processing_frame, method=method,
+                                   window_radius=window_radius)
         self.latest_points = triangulate(xs, ys, frame.shape[1], frame.shape[0], settings)
         frame[mask > 0] = (0, 255, 255)
         cv2.putText(frame, f"laser points: {len(self.latest_points)} | cloud: {self.cloud_size()}",
@@ -301,9 +370,13 @@ class QtScanner(QMainWindow):
             return False
         try:
             current = float(self.manual_angle.text()) if angle is None else angle
-            translated = self.latest_points.copy()
+            profile = self.latest_points.copy()
+            translated = profile.copy()
             translated[:, "XYZ".index(self.axis.currentText())] += self.displacement(current)
-            self.cloud.append(translated)
+            self.raw_profiles.append(profile)
+            self.raw_angles.append(current)
+            self.raw_cloud.append(translated)
+            self.apply_filter(show_message=False)
             self.status.setText(f"Cloud contains {self.cloud_size()} points")
             return True
         except ValueError:
@@ -356,11 +429,126 @@ class QtScanner(QMainWindow):
 
     def clear_cloud(self) -> None:
         self.cloud.clear()
+        self.raw_cloud.clear()
+        self.raw_profiles.clear()
+        self.raw_angles.clear()
         if self.model_axes is not None:
             self.model_axes.clear()
             self.model_axes.set_facecolor("#101316")
             self.model_canvas.draw_idle()
         self.status.setText("Cloud cleared")
+
+    def update_filter_controls(self, technique: str) -> None:
+        while self.filter_params_form.count():
+            item = self.filter_params_form.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        if technique == "Median Filtering":
+            self.median_kernel = QSpinBox()
+            self.median_kernel.setRange(3, 7)
+            self.median_kernel.setSingleStep(2)
+            self.median_kernel.setValue(3)
+            self.filter_params_form.addRow("Kernel size", self.median_kernel)
+        elif technique == "Subpixel Laser-Line Extraction":
+            self.subpixel_window = QSpinBox()
+            self.subpixel_window.setRange(1, 12)
+            self.subpixel_window.setValue(3)
+            self.filter_params_form.addRow("Window radius", self.subpixel_window)
+        elif technique == "Statistical Outlier Removal (SOR)":
+            self.sor_neighbors = QSpinBox()
+            self.sor_neighbors.setRange(1, 200)
+            self.sor_neighbors.setValue(20)
+            self.sor_ratio = QDoubleSpinBox()
+            self.sor_ratio.setRange(0.01, 20.0)
+            self.sor_ratio.setSingleStep(0.1)
+            self.sor_ratio.setValue(2.0)
+            self.filter_params_form.addRow("Neighbors", self.sor_neighbors)
+            self.filter_params_form.addRow("Std. ratio", self.sor_ratio)
+        elif technique == "Savitzky–Golay Filtering":
+            self.savgol_window = QSpinBox()
+            self.savgol_window.setRange(3, 999)
+            self.savgol_window.setSingleStep(2)
+            self.savgol_window.setValue(7)
+            self.savgol_order = QSpinBox()
+            self.savgol_order.setRange(1, 10)
+            self.savgol_order.setValue(2)
+            self.filter_params_form.addRow("Window length", self.savgol_window)
+            self.filter_params_form.addRow("Polynomial order", self.savgol_order)
+        elif technique == "Voxel Grid Downsampling":
+            self.voxel_size = QDoubleSpinBox()
+            self.voxel_size.setRange(0.001, 1000.0)
+            self.voxel_size.setDecimals(3)
+            self.voxel_size.setValue(1.0)
+            self.filter_params_form.addRow("Voxel size mm", self.voxel_size)
+        elif technique == "Kalman Filtering":
+            self.kalman_process = QDoubleSpinBox()
+            self.kalman_process.setRange(0.0, 10000.0)
+            self.kalman_process.setDecimals(5)
+            self.kalman_process.setValue(0.01)
+            self.kalman_measurement = QDoubleSpinBox()
+            self.kalman_measurement.setRange(0.00001, 10000.0)
+            self.kalman_measurement.setDecimals(5)
+            self.kalman_measurement.setValue(1.0)
+            self.filter_params_form.addRow("Process noise", self.kalman_process)
+            self.filter_params_form.addRow("Measurement noise", self.kalman_measurement)
+
+    def reset_filter(self) -> None:
+        self.filter_combo.setCurrentText("None (Raw Data)")
+        self.cloud = [points.copy() for points in self.raw_cloud]
+        self.update_filter_stats(0.0)
+        self.status.setText("Displaying raw cloud")
+
+    def update_filter_stats(self, elapsed_ms: float) -> None:
+        raw_count = sum(len(points) for points in self.raw_cloud)
+        displayed_count = self.cloud_size()
+        removed = (100.0 * (raw_count - displayed_count) / raw_count) if raw_count else 0.0
+        values = np.vstack(self.cloud)[:, 2] if self.cloud and displayed_count else np.empty(0)
+        deviation = float(np.std(values)) if len(values) else 0.0
+        self.filter_stats.setText(
+            f"Technique: {self.filter_combo.currentText()}\n"
+            f"Raw: {raw_count} | Displayed: {displayed_count}\n"
+            f"Removed: {removed:.2f}% | Time: {elapsed_ms:.1f} ms\n"
+            f"Height std. dev.: {deviation:.4f} mm"
+        )
+
+    def apply_filter(self, show_message: bool = True) -> None:
+        import time as timer
+        started = timer.perf_counter()
+        technique = self.filter_combo.currentText()
+        try:
+            if technique == "None (Raw Data)":
+                self.cloud = [points.copy() for points in self.raw_cloud]
+            elif technique == "Median Filtering" or technique == "Subpixel Laser-Line Extraction":
+                # These are acquisition-stage filters; existing captured slices
+                # cannot be reconstructed from frames that were not saved.
+                self.cloud = [points.copy() for points in self.raw_cloud]
+                if show_message and self.raw_cloud:
+                    QMessageBox.information(self, "Acquisition filter", "This filter applies to new camera captures.")
+            elif technique in ("Savitzky–Golay Filtering", "Kalman Filtering"):
+                self.cloud = []
+                for profile, angle in zip(self.raw_profiles, self.raw_angles):
+                    if technique == "Savitzky–Golay Filtering":
+                        filtered = savitzky_golay_profile(profile, self.savgol_window.value(), self.savgol_order.value())
+                    else:
+                        filtered = kalman_profile(profile, self.kalman_process.value(), self.kalman_measurement.value())
+                    translated = filtered.copy()
+                    translated[:, "XYZ".index(self.axis.currentText())] += self.displacement(angle)
+                    self.cloud.append(translated)
+            else:
+                raw = np.vstack(self.raw_cloud) if self.raw_cloud else np.empty((0, 3), dtype=np.float32)
+                if technique == "Statistical Outlier Removal (SOR)":
+                    filtered = statistical_outlier_removal(raw, self.sor_neighbors.value(), self.sor_ratio.value())
+                else:
+                    filtered = voxel_downsample(raw, self.voxel_size.value())
+                self.cloud = [filtered] if len(filtered) else []
+            self.update_filter_stats((timer.perf_counter() - started) * 1000.0)
+            self.status.setText(f"{technique} applied to {self.cloud_size()} points")
+        except (ValueError, RuntimeError, ImportError) as error:
+            self.cloud = [points.copy() for points in self.raw_cloud]
+            self.update_filter_stats((timer.perf_counter() - started) * 1000.0)
+            self.log_message(f"Filter failed: {error}")
+            if show_message:
+                QMessageBox.warning(self, "Filter", str(error))
 
     def open_model(self) -> None:
         if not self.cloud:
